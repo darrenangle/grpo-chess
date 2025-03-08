@@ -262,13 +262,45 @@ def format_reward_func(completions, **kwargs) -> list[float]:
     
     return [0.5 if match else 0.0 for match in matches]
 
-def correctness_reward_func(prompts, completions, next_move, **kwargs) -> list[float]:
-    """Reward function that checks if the move exactly matches the one played in the game."""
+def correctness_reward_func(prompts, completions, next_move, fen, **kwargs) -> list[float]:
+    """
+    Reward function that evaluates the move played in the actual game.
+    If the predicted move matches the game move, the reward is based on how good that move is
+    according to Stockfish.
+    """
+    if not STOCKFISH_AVAILABLE:
+        return [0.0] * len(completions)
+    
+    stockfish_instance = Stockfish()
+    
     responses = [completion[0]["content"] for completion in completions]
     extracted_moves = [extract_xml_answer(r) for r in responses]
     
-    return [1.0 if move.strip() == nm.strip() else 0.0 
-            for move, nm in zip(extracted_moves, next_move)]
+    rewards = []
+    for move, nm, f in zip(extracted_moves, next_move, fen):
+        if move.strip() == nm.strip():
+            # If the move matches the game move, evaluate the game move with Stockfish
+            try:
+                stockfish_instance.set_fen_position(f)
+                top_moves = stockfish_instance.get_top_moves(3)
+                
+                # Check where the game move ranks in Stockfish's evaluation
+                for i, move_info in enumerate(top_moves):
+                    top_move = move_info['Move']
+                    if nm.lower() == top_move.lower():
+                        # Game move is in top 3, reward based on rank
+                        rewards.append(1.0 - (i * 0.3))
+                        break
+                else:
+                    # Game move not in top 3, give smaller reward
+                    rewards.append(0.3)
+            except Exception as e:
+                print(f"Error evaluating game move: {e}")
+                rewards.append(0.3)  # Default reward if evaluation fails
+        else:
+            rewards.append(0.0)  # No reward if predicted move doesn't match game move
+    
+    return rewards
 
 def main():
     # Model and training configuration
