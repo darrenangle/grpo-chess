@@ -1,0 +1,56 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# Model outputs and checkpoints
+outputs/
+wandb/
+*.pt
+*.bin
+*.pth
+*.ckpt
+saved_models/
+
+# Virtual environment
+venv/
+ENV/
+env/
+
+# macOS specific
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# Editor settings
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Log files
+*.log
+
+# Stockfish artifacts
+.stockfish/
