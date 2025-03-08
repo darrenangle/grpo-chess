@@ -60,11 +60,23 @@ Group Relative Policy Optimization (GRPO) improves upon PPO by comparing groups 
 
 ## Usage
 
-To train the model:
+### Training the Model
+
+To train the model with full rewards (including Stockfish move quality evaluation):
 
 ```bash
+# Edit chess_grpo.py to set ablation = False
 python chess_grpo.py
 ```
+
+To train the model with ablation (only format and move legality rewards):
+
+```bash
+# Edit chess_grpo.py to set ablation = True
+python chess_grpo.py
+```
+
+### Testing PGN Parsing
 
 To test the PGN parsing functionality:
 
@@ -72,6 +84,24 @@ To test the PGN parsing functionality:
 # Edit chess_grpo.py to uncomment the test_pgn_parsing() call
 python chess_grpo.py
 ```
+
+### Ablation Study
+
+This project includes an ablation study to demonstrate the power of GRPO with quality-based rewards:
+
+1. **Full Model (GRPO with Quality Rewards)**: Trained with comprehensive reward functions
+   - Format reward (correct XML format)
+   - Move legality reward (valid chess moves)
+   - Stockfish evaluation reward (move quality)
+   - Correctness reward (matching game moves with quality adjustment)
+
+2. **Ablation Model (GRPO without Quality)**: Trained with only basic structural rewards
+   - Format reward (correct XML format)
+   - Move legality reward (valid chess moves)
+   
+The purpose of this ablation study is to demonstrate that GRPO with quality-based rewards can significantly elevate a small language model's chess-playing abilities far beyond its base ELO rating. By comparing against the ablation model (which only learns to make legal moves with proper formatting), we can isolate and quantify the specific impact of the quality-based rewards.
+
+This experiment showcases how targeted reward functions in GRPO can efficiently teach specialized skills to smaller models, potentially allowing them to compete with much larger models on specific tasks by focusing the learning specifically on high-quality outputs.
 
 ## Model Configuration
 
@@ -92,3 +122,23 @@ You can customize the model by modifying:
 - GRPO parameters in `training_args`
 - LoRA configuration in `peft_config`
 - Reward weights and functions
+
+## Evaluation
+
+After training both the full and ablation models, we can evaluate their chess playing strength:
+
+1. **Model Game Analysis**: Have each model play against Stockfish at various ELO levels to determine approximate playing strength
+   
+2. **Comparative Analysis**: Compare the moves chosen by:
+   - Base model (untrained)
+   - Ablation model (format + legality)
+   - Full model (format + legality + quality)
+   - Stockfish
+
+3. **Key Metrics**:
+   - Move match rate with Stockfish's top recommendations
+   - Average position evaluation after model moves
+   - Success rate in tactical positions
+   - Win rate against different ELO-rated opponents
+
+The hypothesis is that the full model with quality-based rewards will demonstrate significantly higher chess playing ability than both the base model and the ablation model, despite being a relatively small language model.

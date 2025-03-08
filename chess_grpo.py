@@ -196,25 +196,47 @@ def get_game_sequence(game, split_percentage=None):
     return None, None, None
 
 def prepare_chess_dataset():
-    """Prepare the chess dataset from local PGN files."""
+    """Prepare the chess dataset from local PGN files with balanced white/black move predictions."""
     # Get all PGN files in the games directory
     games_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "games")
     pgn_files = [os.path.join(games_dir, f) for f in os.listdir(games_dir) if f.endswith('.pgn')]
     
     # Process the PGN games
-    all_samples = []
+    white_move_samples = []
+    black_move_samples = []
+    
     for pgn_file in pgn_files:
         print(f"Processing {pgn_file}...")
         for game in load_game_from_pgn_file(pgn_file):
             sequence, next_move, fen = get_game_sequence(game)
             if sequence and next_move and fen:
-                all_samples.append({
+                # Determine if this is predicting white's or black's move
+                is_predicting_white = sequence.strip().endswith('.')
+                
+                sample = {
                     "position": sequence,
                     "fen": fen,
                     "next_move": next_move
-                })
+                }
+                
+                # Add to appropriate list
+                if is_predicting_white:
+                    white_move_samples.append(sample)
+                else:
+                    black_move_samples.append(sample)
     
-    # Randomly shuffle the dataset
+    print(f"Generated {len(white_move_samples)} white move predictions")
+    print(f"Generated {len(black_move_samples)} black move predictions")
+    
+    # Balance the dataset to ensure 50/50 split
+    min_samples = min(len(white_move_samples), len(black_move_samples))
+    
+    # Randomly select to get equal numbers
+    white_move_samples = random.sample(white_move_samples, min_samples)
+    black_move_samples = random.sample(black_move_samples, min_samples)
+    
+    # Combine and shuffle
+    all_samples = white_move_samples + black_move_samples
     random.shuffle(all_samples)
     
     # Format the dataset for the GRPO trainer
@@ -229,7 +251,7 @@ def prepare_chess_dataset():
             "next_move": sample["next_move"]
         })
     
-    print(f"Created dataset with {len(formatted_data)} samples")
+    print(f"Created balanced dataset with {len(formatted_data)} samples (50% white, 50% black moves)")
     return Dataset.from_list(formatted_data)
 
 # Reward functions
@@ -302,13 +324,24 @@ def correctness_reward_func(prompts, completions, next_move, fen, **kwargs) -> l
     
     return rewards
 
-def main():
+def main(ablation=False):
+    """
+    Main training function with optional ablation mode.
+    
+    Args:
+        ablation: If True, only train with format and legality rewards,
+                 ignoring move quality rewards from Stockfish.
+    """
     # Model and training configuration
     model_name = "Qwen/Qwen2.5-1.5B-Instruct"
     
-    # Prepare output directory
-    output_dir = "outputs/Chess-GRPO"
-    run_name = "Chess-GRPO-Training"
+    # Prepare output directory with ablation indicator if needed
+    if ablation:
+        output_dir = "outputs/Chess-GRPO-Ablation"
+        run_name = "Chess-GRPO-Ablation-Training"
+    else:
+        output_dir = "outputs/Chess-GRPO"
+        run_name = "Chess-GRPO-Training"
     
     # Training configuration
     training_args = GRPOConfig(
@@ -358,16 +391,27 @@ def main():
     dataset = prepare_chess_dataset()
     print(f"Dataset size: {len(dataset)}")
     
-    # Initialize the trainer
-    trainer = GRPOTrainer(
-        model=model,
-        processing_class=tokenizer,
-        reward_funcs=[
+    # Choose reward functions based on ablation setting
+    if ablation:
+        reward_functions = [
+            format_reward_func,
+            legal_move_reward_func
+        ]
+        print("ABLATION MODE: Using only format and legality rewards (ignoring move quality)")
+    else:
+        reward_functions = [
             format_reward_func,
             legal_move_reward_func,
             stockfish_reward_func, 
             correctness_reward_func
-        ],
+        ]
+        print("FULL MODE: Using all rewards including move quality from Stockfish")
+    
+    # Initialize the trainer
+    trainer = GRPOTrainer(
+        model=model,
+        processing_class=tokenizer,
+        reward_funcs=reward_functions,
         args=training_args,
         train_dataset=dataset,
         peft_config=peft_config
@@ -417,4 +461,8 @@ def test_pgn_parsing():
 if __name__ == "__main__":
     # Comment/uncomment to run the desired function
     # test_pgn_parsing()
-    main()
+    
+    # Set ablation to True to run with only format and legality rewards
+    # Set ablation to False to run with full reward functions including Stockfish
+    ablation = False
+    main(ablation=ablation)
