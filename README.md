@@ -58,6 +58,46 @@ Group Relative Policy Optimization (GRPO) improves upon PPO by comparing groups 
 - peft (for efficient fine-tuning)
 - Stockfish (optional, for move evaluation)
 
+## Setup
+
+### Virtual Environment
+
+1. Create a virtual environment:
+   ```bash
+   python -m venv venv
+   ```
+
+2. Activate the virtual environment:
+   ```bash
+   # On Linux/macOS
+   source venv/bin/activate
+   
+   # On Windows
+   venv\Scripts\activate
+   ```
+
+3. Install the required packages:
+   ```bash
+   pip install -r requirements.txt
+   ```
+
+4. Install Stockfish chess engine (optional but recommended for full functionality):
+   ```bash
+   # On Ubuntu/Debian
+   sudo apt-get install stockfish
+   
+   # On macOS with Homebrew
+   brew install stockfish
+   
+   # For Windows, download from https://stockfishchess.org/download/
+   ```
+
+5. Verify your environment:
+   ```bash
+   python check_env.py
+   ```
+   This will check that all required packages are installed and report their versions.
+
 ## Usage
 
 ### Training the Model
