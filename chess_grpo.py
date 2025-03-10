@@ -456,26 +456,26 @@ def correctness_reward_func(prompts, completions, next_move, fen, **kwargs) -> l
                 # Create a fresh instance to prevent state issues
                 fresh_stockfish = Stockfish(path=STOCKFISH_PATH)
                 fresh_stockfish.set_fen_position(f)
-                top_moves = fresh_stockfish.get_top_moves(3)
+                top_moves = fresh_stockfish.get_top_moves(10)
                 
                 # Check where the game move ranks in Stockfish's evaluation
                 for i, move_info in enumerate(top_moves):
                     top_move = move_info['Move']
                     if nm.lower() == top_move.lower():
-                        # Game move is in top 3, reward based on rank
-                        reward = 1.0 - (i * 0.3)
+                        # Game move is in top 10, reward based on rank
+                        reward = 1.0 - (i * 0.1)
                         rewards.append(reward)
                         if len(rewards) == 1:  # Only for first example
                             print(f"Stockfish rank: {i+1}, reward: {reward}")
                         break
                 else:
-                    # Game move not in top 3, give smaller reward
-                    rewards.append(0.3)
+                    # Game move not in top 10, no reward
+                    rewards.append(0.0)
                     if len(rewards) == 1:  # Only for first example
-                        print("Move not in Stockfish top 3, reward: 0.3")
+                        print("Move not in Stockfish top 10, reward: 0.0")
             except Exception as e:
                 print(f"Error evaluating game move: {e}")
-                rewards.append(0.3)  # Default reward if evaluation fails
+                rewards.append(0.0)  # No reward if evaluation fails
         else:
             rewards.append(0.0)  # No reward if predicted move doesn't match game move
             if len(rewards) == 1:  # Only for first example
