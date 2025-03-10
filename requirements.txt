@@ -1,8 +1,12 @@
-torch
+torch>=2.1.0
 chess
 datasets
-transformers
-peft
-trl
+transformers>=4.35.0
+peft>=0.5.0
+trl>=0.7.1
 stockfish
 wandb
+accelerate>=0.22.0
+deepspeed>=0.10.0
+ninja  # For faster compilation
+psutil # For memory monitoring

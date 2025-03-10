@@ -51,12 +51,16 @@ Group Relative Policy Optimization (GRPO) improves upon PPO by comparing groups 
 ## Requirements
 
 - Python 3.8+
-- PyTorch
+- PyTorch 2.1.0+ (with CUDA support)
 - chess
-- transformers
-- trl (for GRPO implementation)
-- peft (for efficient fine-tuning)
+- transformers 4.35.0+
+- trl 0.7.1+ (for GRPO implementation)
+- peft 0.5.0+ (for efficient fine-tuning)
+- accelerate 0.22.0+
+- deepspeed 0.10.0+ (for multi-GPU optimization)
+- ninja (for faster CUDA operations)
 - Stockfish (optional, for move evaluation)
+- 2x NVIDIA RTX 4090 GPUs (recommended)
 
 ## Setup
 
@@ -102,18 +106,22 @@ Group Relative Policy Optimization (GRPO) improves upon PPO by comparing groups 
 
 ### Training the Model
 
+The script has been optimized for training on dual NVIDIA RTX 4090 GPUs.
+
 To train the model with full rewards (including Stockfish move quality evaluation):
 
 ```bash
-# Edit chess_grpo.py to set ablation = False
+# Multi-GPU training (automatically uses distributed training)
 python chess_grpo.py
+
+# Explicitly specify no ablation
+python chess_grpo.py --ablation=False
 ```
 
 To train the model with ablation (only format and move legality rewards):
 
 ```bash
-# Edit chess_grpo.py to set ablation = True
-python chess_grpo.py
+python chess_grpo.py --ablation
 ```
 
 ### Testing PGN Parsing
@@ -121,9 +129,17 @@ python chess_grpo.py
 To test the PGN parsing functionality:
 
 ```bash
-# Edit chess_grpo.py to uncomment the test_pgn_parsing() call
-python chess_grpo.py
+python chess_grpo.py --test-parsing
 ```
+
+### Distributed Training Details
+
+The script automatically detects multiple GPUs and launches distributed training using PyTorch's DistributedDataParallel (DDP) with FSDP (Fully Sharded Data Parallel) optimizations. This provides:
+
+- Efficient memory usage across both 4090s
+- Improved throughput with parallel data processing
+- Automatic model sharding for larger models
+- Optimized gradient communication
 
 ### Ablation Study
 
@@ -145,7 +161,7 @@ This experiment showcases how targeted reward functions in GRPO can efficiently 
 
 ## Model Configuration
 
-The default configuration:
+The default configuration, optimized for dual RTX 4090 GPUs:
 - Base model: Qwen2.5-1.5B-Instruct
 - LoRA with r=16, alpha=64
 - GRPO with beta=0.04, epsilon=0.2
@@ -153,6 +169,11 @@ The default configuration:
 - Weight decay: 0.1
 - Warmup ratio: 0.1
 - Scheduler: cosine
+- Batch size: 4 per device (8 total across both GPUs)
+- Gradient accumulation steps: 2
+- FSDP (Fully Sharded Data Parallel) with BF16 precision
+- Data loading: 4 workers per GPU for parallel processing
+- Multi-processing: Uses ProcessPoolExecutor for dataset preparation
 
 ## Customization
 
