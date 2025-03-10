@@ -35,14 +35,16 @@ The sequence will end with either:
 1. A move number followed by a period (e.g., "10.") - this means you should predict White's next move
 2. A move without a following move number - this means you should predict Black's next move
 
-Respond in the following format:
+You MUST respond in the following format and ONLY this format:
 
 <reasoning>
-Analyze the position carefully. Consider various candidate moves and their consequences.
+Analyze the sequence of moves (PGN) carefully. Consider various candidate moves and their consequences.
 </reasoning>
 <answer>
 e4
 </answer>
+
+Make sure to use the exact format with the <reasoning> and <answer> tags. Your suggested move in the <answer> tag must be a valid chess move in Standard Algebraic Notation (SAN) (e.g., e4, Nf3, O-O, exd5, Qxf7+, Rfd1). All other formats (like UCI) will be rejected.
 """
 
 XML_FORMAT = """\
@@ -57,39 +59,34 @@ XML_FORMAT = """\
 def extract_xml_answer(text: str) -> str:
     """Extract the answer from the XML format."""
     if "<answer>" not in text or "</answer>" not in text:
+        print(f"WARNING: No <answer> tag found in response: '{text}'")
         return ""
-    answer = text.split("<answer>")[-1]
-    answer = answer.split("</answer>")[0]
-    return answer.strip()
+    try:
+        answer = text.split("<answer>")[-1]
+        answer = answer.split("</answer>")[0]
+        return answer.strip()
+    except Exception as e:
+        print(f"Error extracting answer: {e} from: {text}")
+        return ""
 
 def is_valid_move(move_str: str, fen: str) -> bool:
-    """Check if a move is valid in the given position."""
+    """Check if a move is valid in the given position using Standard Algebraic Notation (SAN)."""
     if not move_str or len(move_str.strip()) == 0:
         return False
         
     try:
+        # Only validate using SAN format
         board = chess.Board(fen)
-        # Try to parse the move string
-        move = chess.Move.from_uci(move_str.lower())
+        move = board.parse_san(move_str)
         return move in board.legal_moves
-    except:
-        try:
-            # Try to parse as SAN
-            board = chess.Board(fen)
-            move = board.parse_san(move_str)
-            return move in board.legal_moves
-        except Exception as e:
-            # Specific error for debugging
-            if "illegal san" in str(e):
-                # Just return False quietly for illegal SAN
-                pass
-            else:
-                # Print other errors for debugging
-                print(f"Move validation error: {e} for move '{move_str}' in position {fen}")
-            return False
+    except Exception as e:
+        # Print errors for debugging
+        if "illegal san" not in str(e):
+            print(f"Move validation error: {e} for move '{move_str}' in position {fen}")
+        return False
 
 def evaluate_move(move_str: str, fen: str, stockfish_instance: Stockfish) -> float:
-    """Evaluate a move using Stockfish."""
+    """Evaluate a move using Stockfish with 10 top moves."""
     if not STOCKFISH_AVAILABLE:
         return 0.0
     
@@ -102,18 +99,19 @@ def evaluate_move(move_str: str, fen: str, stockfish_instance: Stockfish) -> flo
         # Set up the position
         stockfish_instance.set_fen_position(fen)
         
-        # Get top moves from Stockfish
-        top_moves = stockfish_instance.get_top_moves(3)
+        # Get top 10 moves from Stockfish
+        top_moves = stockfish_instance.get_top_moves(10)
         
         # Check if our move is among the top moves
         for i, move_info in enumerate(top_moves):
             top_move = move_info['Move']
             if move_str.lower() == top_move.lower():
-                # Return reward based on rank (best = 1.0, second = 0.7, third = 0.4)
-                return 1.0 - (i * 0.3)
+                # Return reward based on rank (best = 1.0, gradually decreasing)
+                # Top move gets 1.0, then 0.9, 0.8, etc.
+                return 1.0 - (i * 0.1)
         
-        # Move not in top 3
-        return 0.1  # Small reward for any legal move
+        # Move not in top 10
+        return 0.0  # No reward if not in top 10
     except Exception as e:
         print(f"Error evaluating move: {e}")
         return 0.0
@@ -332,13 +330,17 @@ def prepare_chess_dataset(use_multiprocessing=True):
     all_samples = white_move_samples + black_move_samples
     random.shuffle(all_samples)
     
-    # Format the dataset for the GRPO trainer (simple version without nested functions)
+    # Format the dataset for the GRPO trainer with explicit color and tag instructions
     formatted_data = []
     for sample in all_samples:
+        # Determine if we're predicting White's or Black's move
+        is_white_move = sample['position'].strip().endswith('.')
+        color = "White" if is_white_move else "Black"
+        
         formatted_data.append({
             "prompt": [
                 {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": f"Based on this chess game sequence, predict the next move:\n\n{sample['position']}"}
+                {"role": "user", "content": f"Based on this chess game sequence, pick the next best move for {color}. Don't forget to put your answer in <answer></answer> tags.\n\n{sample['position']}"}
             ],
             "fen": sample["fen"],
             "next_move": sample["next_move"]
@@ -354,6 +356,13 @@ def legal_move_reward_func(prompts, completions, fen, **kwargs) -> list[float]:
     """Reward function that checks if the move is legal."""
     responses = [completion[0]["content"] for completion in completions]
     extracted_moves = [extract_xml_answer(r) for r in responses]
+    
+    # Debug first example
+    if len(responses) > 0:
+        print(f"\n--- Legal Move Check ---")
+        print(f"Response: '{responses[0][:100]}...'")
+        print(f"Extracted move: '{extracted_moves[0]}'")
+        print(f"Is valid: {is_valid_move(extracted_moves[0], fen[0])}")
     
     return [1.0 if is_valid_move(move, f) else 0.0 
             for move, f in zip(extracted_moves, fen)]
@@ -372,16 +381,47 @@ def stockfish_reward_func(prompts, completions, fen, **kwargs) -> list[float]:
     responses = [completion[0]["content"] for completion in completions]
     extracted_moves = [extract_xml_answer(r) for r in responses]
     
-    return [evaluate_move(move, f, stockfish_instance) 
-            for move, f in zip(extracted_moves, fen)]
+    rewards = []
+    for move, f in zip(extracted_moves, fen):
+        try:
+            stockfish_instance.set_fen_position(f)
+            top_moves = stockfish_instance.get_top_moves(10)
+            
+            # Check if the move is in the top 10
+            for i, move_info in enumerate(top_moves):
+                if move.lower() == move_info['Move'].lower():
+                    # Reward based on rank (1.0 for best, decreasing by 0.1)
+                    rewards.append(1.0 - (i * 0.1))
+                    break
+            else:
+                # Not in top 10, zero reward
+                rewards.append(0.0)
+        except Exception as e:
+            print(f"Error in stockfish evaluation: {e}")
+            rewards.append(0.0)
+    
+    return rewards
 
 def format_reward_func(completions, **kwargs) -> list[float]:
     """Reward function that checks if the completion has the correct format."""
-    pattern = r"<reasoning>.*?</reasoning>\s*<answer>.*?</answer>"
-    responses = [completion[0]["content"] for completion in completions]
-    matches = [re.search(pattern, r, re.DOTALL) is not None for r in responses]
+    # Check for both strict and loose formats
+    strict_pattern = r"<reasoning>\n.*?\n</reasoning>\n<answer>\n.*?\n</answer>"
+    loose_pattern = r"<reasoning>.*?</reasoning>\s*<answer>.*?</answer>"
     
-    return [0.5 if match else 0.0 for match in matches]
+    responses = [completion[0]["content"] for completion in completions]
+    strict_matches = [re.search(strict_pattern, r, re.DOTALL) is not None for r in responses]
+    loose_matches = [re.search(loose_pattern, r, re.DOTALL) is not None for r in responses]
+    
+    # Print full first response to debug format issues
+    if responses:
+        print(f"\n--- Format Reward ---")
+        print(f"Full response:\n{responses[0]}")
+        print(f"Has strict format (<reasoning>\\n...\\n</reasoning>): {strict_matches[0]}")
+        print(f"Has loose format (<reasoning>...</reasoning>): {loose_matches[0]}")
+    
+    # Give higher reward for strict format, but still reward loose format
+    return [1.0 if strict_match else (0.5 if loose_match else 0.0) 
+            for strict_match, loose_match in zip(strict_matches, loose_matches)]
 
 def correctness_reward_func(prompts, completions, next_move, fen, **kwargs) -> list[float]:
     """
@@ -401,6 +441,13 @@ def correctness_reward_func(prompts, completions, next_move, fen, **kwargs) -> l
     responses = [completion[0]["content"] for completion in completions]
     extracted_moves = [extract_xml_answer(r) for r in responses]
     
+    # Debug output for first example
+    if responses and extracted_moves and next_move:
+        print(f"\n--- Correctness Reward ---")
+        print(f"Extracted move: '{extracted_moves[0]}'")
+        print(f"Expected move: '{next_move[0]}'")
+        print(f"Match: {extracted_moves[0].strip() == next_move[0].strip()}")
+    
     rewards = []
     for move, nm, f in zip(extracted_moves, next_move, fen):
         if move.strip() == nm.strip():
@@ -416,16 +463,53 @@ def correctness_reward_func(prompts, completions, next_move, fen, **kwargs) -> l
                     top_move = move_info['Move']
                     if nm.lower() == top_move.lower():
                         # Game move is in top 3, reward based on rank
-                        rewards.append(1.0 - (i * 0.3))
+                        reward = 1.0 - (i * 0.3)
+                        rewards.append(reward)
+                        if len(rewards) == 1:  # Only for first example
+                            print(f"Stockfish rank: {i+1}, reward: {reward}")
                         break
                 else:
                     # Game move not in top 3, give smaller reward
                     rewards.append(0.3)
+                    if len(rewards) == 1:  # Only for first example
+                        print("Move not in Stockfish top 3, reward: 0.3")
             except Exception as e:
                 print(f"Error evaluating game move: {e}")
                 rewards.append(0.3)  # Default reward if evaluation fails
         else:
             rewards.append(0.0)  # No reward if predicted move doesn't match game move
+            if len(rewards) == 1:  # Only for first example
+                print("No match with game move, reward: 0.0")
+    
+    return rewards
+
+def count_xml_tags(text):
+    """Count the XML tags in the response to provide partial rewards for formatting."""
+    count = 0.0
+    if "<reasoning>" in text:
+        count += 0.125
+    if "</reasoning>" in text:
+        count += 0.125
+    if "<answer>" in text:
+        count += 0.125
+    if "</answer>" in text:
+        count += 0.125
+    return count
+
+def xml_tag_reward_func(completions, **kwargs) -> list[float]:
+    """Reward function that gives partial credit for having correct XML tags."""
+    responses = [completion[0]["content"] for completion in completions]
+    rewards = [count_xml_tags(r) for r in responses]
+    
+    # Debug first example
+    if responses:
+        print(f"\n--- XML Tag Count Reward ---")
+        print(f"Response has these tags:")
+        print(f"  <reasoning>: {'<reasoning>' in responses[0]}")
+        print(f"  </reasoning>: {'</reasoning>' in responses[0]}")
+        print(f"  <answer>: {'<answer>' in responses[0]}")
+        print(f"  </answer>: {'</answer>' in responses[0]}")
+        print(f"Tag reward: {rewards[0]}")
     
     return rewards
 
@@ -438,7 +522,7 @@ def configure_wandb_logging(ablation=False):
             return True
             
         # Add useful tags for experiment tracking
-        model_name = "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"
+        model_name = "nvidia/AceInstruct-7B"
         rewards = "format,legal" if ablation else "format,legal,stockfish,correctness"
         
         wandb.init(
@@ -486,7 +570,7 @@ def main(ablation=False, disable_multiprocessing=False):
     if "wandb" in sys.modules:
         configure_wandb_logging(ablation=ablation)
     # Model and training configuration
-    model_name = "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"
+    model_name = "nvidia/AceInstruct-7B"
     
     # Prepare output directory with ablation indicator if needed
     if ablation:
@@ -496,7 +580,7 @@ def main(ablation=False, disable_multiprocessing=False):
         output_dir = "outputs/Chess-GRPO"
         run_name = "Chess-GRPO-Training"
     
-    # Training configuration optimized for dual 4090s
+    # Training configuration with fixed batch sizes
     training_args = GRPOConfig(
         output_dir=output_dir,
         run_name=run_name,
@@ -508,15 +592,15 @@ def main(ablation=False, disable_multiprocessing=False):
         lr_scheduler_type='cosine',
         logging_steps=1,
         bf16=True,
-        per_device_train_batch_size=4,        # Increased batch size
-        gradient_accumulation_steps=2,        # Reduced GAStep since batch size is higher
-        num_generations=4,                    # Must be divisible by per_device_train_batch_size
-        max_prompt_length=512,                # Chess games can be long
-        max_completion_length=256,
+        per_device_train_batch_size=1,       # 1 per device = 2 total with 2 GPUs
+        gradient_accumulation_steps=4,       # Increase gradient accumulation
+        num_generations=2,                   # Must be equal to total batch size (2 GPUs x 1 = 2)
+        max_prompt_length=512,               # Chess games can be long
+        max_completion_length=2048,          # Much longer completion to ensure full answers
         num_train_epochs=1,
         save_strategy="steps",               # Save at regular steps
         save_steps=100,                      # Save every 100 steps (must match eval_steps)
-        save_total_limit=10,                 # Keep last 10 checkpoints
+        save_total_limit=50,                 # Keep last 50 checkpoints
         save_safetensors=True,               # Use faster safetensors format
         load_best_model_at_end=True,         # Load best model at end based on reward
         metric_for_best_model="eval_reward", # Use reward as metric for best model
@@ -540,7 +624,6 @@ def main(ablation=False, disable_multiprocessing=False):
         lora_dropout=0.05,
     )
     
-    # Let GRPOTrainer handle model loading and distribution
     # Load the model with simple configuration, don't use device_map
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
@@ -585,12 +668,14 @@ def main(ablation=False, disable_multiprocessing=False):
     # Choose reward functions based on ablation setting
     if ablation:
         reward_functions = [
+            xml_tag_reward_func,    # Add partial XML tag rewards
             format_reward_func,
             legal_move_reward_func
         ]
         print("ABLATION MODE: Using only format and legality rewards (ignoring move quality)")
     else:
         reward_functions = [
+            xml_tag_reward_func,    # Add partial XML tag rewards
             format_reward_func,
             legal_move_reward_func,
             stockfish_reward_func, 
