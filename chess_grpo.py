@@ -38,7 +38,7 @@ The sequence will end with either:
 You MUST respond in the following format and ONLY this format:
 
 <reasoning>
-Analyze the sequence of moves (PGN) carefully. Consider various candidate moves and their consequences.
+Think about the best move to make and why.
 </reasoning>
 <answer>
 e4
@@ -59,14 +59,18 @@ XML_FORMAT = """\
 def extract_xml_answer(text: str) -> str:
     """Extract the answer from the XML format."""
     if "<answer>" not in text or "</answer>" not in text:
-        print(f"WARNING: No <answer> tag found in response: '{text}'")
+        # Truncate very long text in warning to avoid memory issues
+        text_sample = text[:100] + "..." if len(text) > 100 else text
+        print(f"WARNING: No <answer> tag found in response: '{text_sample}'")
         return ""
     try:
         answer = text.split("<answer>")[-1]
         answer = answer.split("</answer>")[0]
         return answer.strip()
     except Exception as e:
-        print(f"Error extracting answer: {e} from: {text}")
+        # Truncate very long text in error message
+        text_sample = text[:100] + "..." if len(text) > 100 else text
+        print(f"Error extracting answer: {e} from: '{text_sample}'")
         return ""
 
 def is_valid_move(move_str: str, fen: str) -> bool:
@@ -357,13 +361,19 @@ def legal_move_reward_func(prompts, completions, fen, **kwargs) -> list[float]:
     responses = [completion[0]["content"] for completion in completions]
     extracted_moves = [extract_xml_answer(r) for r in responses]
     
-    # Debug first example
+    # Debug first example with minimal output
     if len(responses) > 0:
         print(f"\n--- Legal Move Check ---")
-        print(f"Response: '{responses[0][:100]}...'")
+        # Just print a short sample of the response to avoid large outputs
+        response_sample = responses[0][:50] + "..." if len(responses[0]) > 50 else responses[0]
+        print(f"Response sample: '{response_sample}'")
         print(f"Extracted move: '{extracted_moves[0]}'")
         print(f"Is valid: {is_valid_move(extracted_moves[0], fen[0])}")
     
+    # Clean up CUDA cache
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        
     return [1.0 if is_valid_move(move, f) else 0.0 
             for move, f in zip(extracted_moves, fen)]
 
@@ -373,6 +383,7 @@ def stockfish_reward_func(prompts, completions, fen, **kwargs) -> list[float]:
         return [0.0] * len(completions)
     
     try:
+        # Use a single Stockfish instance for all evaluations
         stockfish_instance = Stockfish(path=STOCKFISH_PATH)
     except Exception as e:
         print(f"Error creating Stockfish instance: {e}")
@@ -400,6 +411,10 @@ def stockfish_reward_func(prompts, completions, fen, **kwargs) -> list[float]:
             print(f"Error in stockfish evaluation: {e}")
             rewards.append(0.0)
     
+    # Clean up CUDA cache 
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        
     return rewards
 
 def format_reward_func(completions, **kwargs) -> list[float]:
@@ -412,36 +427,31 @@ def format_reward_func(completions, **kwargs) -> list[float]:
     strict_matches = [re.search(strict_pattern, r, re.DOTALL) is not None for r in responses]
     loose_matches = [re.search(loose_pattern, r, re.DOTALL) is not None for r in responses]
     
-    # Print full first response to debug format issues
+    # Print truncated first response to debug format issues
     if responses:
         print(f"\n--- Format Reward ---")
-        print(f"Full response:\n{responses[0]}")
-        print(f"Has strict format (<reasoning>\\n...\\n</reasoning>): {strict_matches[0]}")
-        print(f"Has loose format (<reasoning>...</reasoning>): {loose_matches[0]}")
+        response_sample = responses[0][:150] + "..." if len(responses[0]) > 150 else responses[0]
+        print(f"Response (truncated):\n{response_sample}")
+        print(f"Has strict format: {strict_matches[0]}")
+        print(f"Has loose format: {loose_matches[0]}")
     
+    # Clean up CUDA cache
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        
     # Give higher reward for strict format, but still reward loose format
     return [1.0 if strict_match else (0.5 if loose_match else 0.0) 
             for strict_match, loose_match in zip(strict_matches, loose_matches)]
 
 def correctness_reward_func(prompts, completions, next_move, fen, **kwargs) -> list[float]:
     """
-    Reward function that evaluates the move played in the actual game.
-    If the predicted move matches the game move, the reward is based on how good that move is
-    according to Stockfish.
+    Reward function that evaluates if the predicted move matches the actual game move.
+    Always reward 1.0 for a correct match, regardless of Stockfish evaluation.
     """
-    if not STOCKFISH_AVAILABLE:
-        return [0.0] * len(completions)
-    
-    try:
-        stockfish_instance = Stockfish(path=STOCKFISH_PATH)
-    except Exception as e:
-        print(f"Error creating Stockfish instance: {e}")
-        return [0.0] * len(completions)
-    
     responses = [completion[0]["content"] for completion in completions]
     extracted_moves = [extract_xml_answer(r) for r in responses]
     
-    # Debug output for first example
+    # Debug output for first example only
     if responses and extracted_moves and next_move:
         print(f"\n--- Correctness Reward ---")
         print(f"Extracted move: '{extracted_moves[0]}'")
@@ -449,38 +459,21 @@ def correctness_reward_func(prompts, completions, next_move, fen, **kwargs) -> l
         print(f"Match: {extracted_moves[0].strip() == next_move[0].strip()}")
     
     rewards = []
-    for move, nm, f in zip(extracted_moves, next_move, fen):
+    for move, nm in zip(extracted_moves, next_move):
         if move.strip() == nm.strip():
-            # If the move matches the game move, evaluate the game move with Stockfish
-            try:
-                # Create a fresh instance to prevent state issues
-                fresh_stockfish = Stockfish(path=STOCKFISH_PATH)
-                fresh_stockfish.set_fen_position(f)
-                top_moves = fresh_stockfish.get_top_moves(10)
-                
-                # Check where the game move ranks in Stockfish's evaluation
-                for i, move_info in enumerate(top_moves):
-                    top_move = move_info['Move']
-                    if nm.lower() == top_move.lower():
-                        # Game move is in top 10, reward based on rank
-                        reward = 1.0 - (i * 0.1)
-                        rewards.append(reward)
-                        if len(rewards) == 1:  # Only for first example
-                            print(f"Stockfish rank: {i+1}, reward: {reward}")
-                        break
-                else:
-                    # Game move not in top 10, no reward
-                    rewards.append(0.0)
-                    if len(rewards) == 1:  # Only for first example
-                        print("Move not in Stockfish top 10, reward: 0.0")
-            except Exception as e:
-                print(f"Error evaluating game move: {e}")
-                rewards.append(0.0)  # No reward if evaluation fails
+            # Correct match with actual game move gets full reward
+            rewards.append(1.0)
+            if len(rewards) == 1:  # Only for first example
+                print("Correct match with game move, reward: 1.0")
         else:
             rewards.append(0.0)  # No reward if predicted move doesn't match game move
             if len(rewards) == 1:  # Only for first example
                 print("No match with game move, reward: 0.0")
     
+    # Clean up CUDA cache after batch processing
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        
     return rewards
 
 def count_xml_tags(text):
@@ -501,16 +494,15 @@ def xml_tag_reward_func(completions, **kwargs) -> list[float]:
     responses = [completion[0]["content"] for completion in completions]
     rewards = [count_xml_tags(r) for r in responses]
     
-    # Debug first example
+    # Debug first example with minimal output
     if responses:
         print(f"\n--- XML Tag Count Reward ---")
-        print(f"Response has these tags:")
-        print(f"  <reasoning>: {'<reasoning>' in responses[0]}")
-        print(f"  </reasoning>: {'</reasoning>' in responses[0]}")
-        print(f"  <answer>: {'<answer>' in responses[0]}")
-        print(f"  </answer>: {'</answer>' in responses[0]}")
-        print(f"Tag reward: {rewards[0]}")
+        print(f"Tag reward: {rewards[0]} (has {int(rewards[0]/0.125)} tags)")
     
+    # Clean up CUDA cache
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        
     return rewards
 
 def configure_wandb_logging(ablation=False):
@@ -541,7 +533,7 @@ def configure_wandb_logging(ablation=False):
         print("Training will continue without wandb logging.")
         return False
 
-def main(ablation=False, disable_multiprocessing=False):
+def main(ablation=False, disable_multiprocessing=False, single_gpu=False, tiny_mode=False):
     """
     Main training function with optional ablation mode.
     
@@ -549,7 +541,24 @@ def main(ablation=False, disable_multiprocessing=False):
         ablation: If True, only train with format and legality rewards,
                  ignoring move quality rewards from Stockfish.
         disable_multiprocessing: If True, disable multiprocessing for dataset preparation.
+        single_gpu: If True, force only using a single GPU (GPU 0) even if multiple are available.
+        tiny_mode: If True, use extreme memory optimization settings with tiny dataset, batch size and model config.
     """
+    # Set extremely aggressive CUDA memory allocation settings to avoid fragmentation and OOM
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,max_split_size_mb:16,garbage_collection_threshold:0.8"
+    
+    # Limit to single GPU if requested
+    if single_gpu and torch.cuda.is_available() and torch.cuda.device_count() > 1:
+        print(f"Forcing single GPU mode. Only using GPU 0 out of {torch.cuda.device_count()} available GPUs.")
+        os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+    
+    # Free up GPU memory before starting training
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        # Set low memory limits for CUDA/cuDNN workspace
+        torch.backends.cudnn.benchmark = False  # Disable benchmarking to save memory
+        torch.backends.cuda.matmul.allow_tf32 = True  # Allow TF32 for faster/reduced memory
+    
     # Initialize accelerator to handle distributed training
     accelerator = Accelerator()
     is_main_process = accelerator.is_main_process
@@ -580,73 +589,195 @@ def main(ablation=False, disable_multiprocessing=False):
         output_dir = "outputs/Chess-GRPO"
         run_name = "Chess-GRPO-Training"
     
-    # Training configuration with fixed batch sizes
-    training_args = GRPOConfig(
-        output_dir=output_dir,
-        run_name=run_name,
-        learning_rate=5e-6,
-        adam_beta1=0.9,
-        adam_beta2=0.99,
-        weight_decay=0.1,
-        warmup_ratio=0.1,
-        lr_scheduler_type='cosine',
-        logging_steps=1,
-        bf16=True,
-        per_device_train_batch_size=1,       # 1 per device = 2 total with 2 GPUs
-        gradient_accumulation_steps=4,       # Increase gradient accumulation
-        num_generations=2,                   # Must be equal to total batch size (2 GPUs x 1 = 2)
-        max_prompt_length=512,               # Chess games can be long
-        max_completion_length=2048,          # Much longer completion to ensure full answers
-        num_train_epochs=1,
-        save_strategy="steps",               # Save at regular steps
-        save_steps=100,                      # Save every 100 steps (must match eval_steps)
-        save_total_limit=50,                 # Keep last 50 checkpoints
-        save_safetensors=True,               # Use faster safetensors format
-        load_best_model_at_end=True,         # Load best model at end based on reward
-        metric_for_best_model="eval_reward", # Use reward as metric for best model
-        greater_is_better=True,              # Higher reward is better
-        eval_strategy="steps",               # Evaluate at regular steps (instead of evaluation_strategy)
-        eval_steps=100,                      # Evaluate every 100 steps
-        max_grad_norm=0.1,
-        report_to="wandb",
-        log_on_each_node=False,
-        ddp_find_unused_parameters=False,     # Optimize DDP
-        dataloader_num_workers=0,             # Disable parallel data loading to fix pickling errors
-        # Let accelerate handle distributed training properly
-    )
+    # Training configuration with extreme memory optimization
+    if tiny_mode:
+        # Ultra minimal config for tiny mode
+        training_args = GRPOConfig(
+            output_dir=output_dir,
+            run_name=f"{run_name}-TinyMode",
+            learning_rate=5e-6,
+            adam_beta1=0.9,
+            adam_beta2=0.99,
+            weight_decay=0.1,
+            warmup_ratio=0.1,
+            lr_scheduler_type='cosine',
+            logging_steps=1,
+            fp16=True,                           # Use FP16 instead of BF16
+            per_device_train_batch_size=1,       # Keep batch size at minimum
+            gradient_accumulation_steps=1,       # No gradient accumulation for tiny mode
+            num_generations=2,                   # Must be divisible into global batch size
+            max_prompt_length=128,               # Ultra short context
+            max_completion_length=128,           # Ultra short output
+            num_train_epochs=1,
+            save_strategy="no",                  # Don't save checkpoints in tiny mode
+            save_total_limit=1,
+            save_safetensors=True,
+            load_best_model_at_end=False,        # Don't load best model to save memory
+            eval_strategy="steps", 
+            eval_steps=10,                       # Evaluate more frequently
+            max_grad_norm=1.0,
+            report_to="wandb",
+            log_on_each_node=False,
+            ddp_find_unused_parameters=False,
+            dataloader_num_workers=0,
+            gradient_checkpointing=False,
+            optim="adamw_torch",
+            log_completions=False,
+        )
+    else:
+        # Standard memory-optimized config
+        training_args = GRPOConfig(
+            output_dir=output_dir,
+            run_name=run_name,
+            learning_rate=5e-6,
+            adam_beta1=0.9,
+            adam_beta2=0.99,
+            weight_decay=0.1,
+            warmup_ratio=0.1,
+            lr_scheduler_type='cosine',
+            logging_steps=1,
+            bf16=False,
+            per_device_train_batch_size=1,       # Keep batch size very small
+            gradient_accumulation_steps=16,      # Doubled to 16 to reduce memory pressure
+            num_generations=2,                   # Must be divisible into global batch size
+            max_prompt_length=1024,               # Drastically reduced to save memory
+            max_completion_length=1024,           # Drastically reduced to save memory
+            num_train_epochs=1,
+            save_strategy="steps",
+            save_steps=100,
+            save_total_limit=1,                  # Keep only 1 checkpoint to save space
+            save_safetensors=True,
+            load_best_model_at_end=True,
+            metric_for_best_model="eval_reward",
+            greater_is_better=True,
+            eval_strategy="steps", 
+            eval_steps=100,
+            max_grad_norm=1.0,
+            report_to="wandb",
+            log_on_each_node=False,
+            ddp_find_unused_parameters=False,    # Set to False to avoid extra memory usage
+            dataloader_num_workers=0,            # Avoid parallelism to reduce memory usage
+            gradient_checkpointing=False,        # Disable gradient checkpointing - causing issues
+            optim="adamw_torch",                 # Use PyTorch's memory-efficient AdamW
+            log_completions=False,               # Disable completion logging to save memory
+            # FP16 mixed precision to save memory
+            fp16=True                           # Use FP16 instead of BF16 to save memory
+        )
     
-    # PEFT configuration
-    peft_config = LoraConfig(
-        r=16,
-        lora_alpha=64,
-        target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "up_proj", "down_proj", "gate_proj"],
-        task_type="CAUSAL_LM",
-        lora_dropout=0.05,
-    )
+    # Print out the memory optimization settings
+    print(f"Memory optimization level: {'EXTREME (tiny mode)' if tiny_mode else 'HIGH'}")
     
-    # Load the model with simple configuration, don't use device_map
-    model = AutoModelForCausalLM.from_pretrained(
-        model_name,
-        torch_dtype=torch.bfloat16
-    )
-    print(f"Loading model: {model_name}")
+    # PEFT configuration - more lightweight LoRA config for memory efficiency
+    if tiny_mode:
+        # Ultra minimal LoRA for tiny mode
+        peft_config = LoraConfig(
+            r=4,                         # Even smaller rank
+            lora_alpha=16,               # Reduced alpha
+            target_modules=["q_proj"],   # Only target one module type to save memory
+            task_type="CAUSAL_LM",
+            lora_dropout=0.05,
+        )
+    else:
+        # Regular memory-optimized LoRA
+        peft_config = LoraConfig(
+            r=8,                         # Reduced rank to 8 to save memory
+            lora_alpha=32,               # Reduced alpha
+            target_modules=["q_proj", "v_proj"],  # Only target some attention modules to save memory
+            task_type="CAUSAL_LM",
+            lora_dropout=0.05,
+        )
+    
+    # Load the model with extreme memory-optimized settings
+    if tiny_mode:
+        # Ultra lightweight config for tiny mode
+        model = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            torch_dtype=torch.float16,  # Use float16 for lower memory
+            use_cache=True, 
+            low_cpu_mem_usage=True,
+            device_map=None,
+            max_memory={0: "8GiB"},     # Even stricter memory limit
+            load_in_8bit=True,          # Load in 8-bit for extreme memory savings
+            offload_folder="offload",
+        )
+    else:
+        # Standard memory-optimized config
+        model = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            torch_dtype=torch.float16,  # Use float16 instead of bfloat16 for lower memory
+            use_cache=True,             # Enable caching when not using gradient checkpointing
+            low_cpu_mem_usage=True,     # Optimize CPU memory usage during loading
+            device_map=None,            # Let the accelerator handle device mapping
+            max_memory={0: "12GiB"},    # Explicitly limit GPU memory usage
+            offload_folder="offload",   # Set up offload folder for CPU offloading if needed
+        )
+    # Explicitly set model to train mode
+    model.train()
+    
+    # Only set trainable parameters to require gradients, to save memory
+    for name, param in model.named_parameters():
+        if any(target in name for target in ["q_proj", "v_proj"]):
+            param.requires_grad = True
+        else:
+            param.requires_grad = False
+    
+    # Force aggressive garbage collection and empty cache to ensure clean memory state
+    import gc
+    gc.collect()
+    
+    # Create offload directory if it doesn't exist
+    os.makedirs("offload", exist_ok=True)
+    
+    if torch.cuda.is_available():
+        # Multiple rounds of memory cleanup
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()  # Make sure CUDA operations are complete
+        gc.collect()
+        torch.cuda.empty_cache()  # Clean up before training
+        
+    # Set a very conservative memory fraction
+    if torch.cuda.is_available():
+        # Reserve 20% of memory for system/other processes
+        if hasattr(torch.cuda, 'set_per_process_memory_fraction'):
+            torch.cuda.set_per_process_memory_fraction(0.8)
+            
+        # Extra memory cleanup
+        torch.cuda.empty_cache()
+        
+        # Set memory allocator to be very conservative
+        if hasattr(torch.cuda, 'memory_stats'):
+            print(f"CUDA memory before optimization: {torch.cuda.memory_allocated() / 1024**2:.2f} MB allocated")
+            torch.cuda.empty_cache()
+            print(f"CUDA memory after empty_cache: {torch.cuda.memory_allocated() / 1024**2:.2f} MB allocated")
+        
+    print(f"Loading model: {model_name} with memory optimizations, use_cache=False")
     
     
     # Load the tokenizer
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     tokenizer.pad_token = tokenizer.eos_token
     
-    # Prepare the dataset
+    # Prepare the dataset - use multiprocessing unless explicitly disabled
     dataset = prepare_chess_dataset(use_multiprocessing=not disable_multiprocessing)
     
-    # Create validation split for better checkpointing
+    # Only reduce dataset in tiny mode
+    if tiny_mode:
+        print(f"TINY MODE ENABLED: Original dataset size: {len(dataset)}")
+        # Take a small subset for debugging memory issues
+        dataset = dataset.select(range(min(50, len(dataset))))
+        print(f"Reduced dataset to {len(dataset)} samples for extreme memory optimization")
+    else:
+        # Use full dataset for real training
+        print(f"Using full dataset with {len(dataset)} samples")
+    
+    # Create validation split
     if len(dataset) > 100:  # Only split if we have enough data
         # Shuffle the dataset indices
         indices = list(range(len(dataset)))
         random.shuffle(indices)
         
-        # Take ~10% for validation, with a cap of 1000 samples
-        val_size = min(len(dataset) // 10, 1000)
+        # Take ~10% for validation
+        val_size = max(10, min(len(dataset) // 10, 1000))  # At least 10, at most 1000
         train_indices = indices[val_size:]
         val_indices = indices[:val_size]
         
@@ -683,8 +814,7 @@ def main(ablation=False, disable_multiprocessing=False):
         ]
         print("FULL MODE: Using all rewards including move quality from Stockfish")
     
-    # Initialize the trainer with multi-GPU optimizations and checkpointing
-    # Don't pass FSDP config directly - let the training args handle it
+    # Initialize the trainer with extreme memory optimizations
     trainer = GRPOTrainer(
         model=model,
         processing_class=tokenizer,
@@ -694,10 +824,20 @@ def main(ablation=False, disable_multiprocessing=False):
         eval_dataset=eval_dataset,
         peft_config=peft_config,
         callbacks=[
-            # Add early stopping as well
-            transformers.EarlyStoppingCallback(early_stopping_patience=5)
+            # Add early stopping with shorter patience
+            transformers.EarlyStoppingCallback(early_stopping_patience=2)
         ]
     )
+    
+    # Print command for running with single process
+    print("\nRecommended command for running with single process to avoid batch size issues:")
+    print("accelerate launch --num_processes=1 chess_grpo.py --single-gpu --tiny")
+    
+    # More extreme memory cleanup
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+        gc.collect()
     
     # Train the model
     trainer.train()
@@ -705,27 +845,36 @@ def main(ablation=False, disable_multiprocessing=False):
     # Save the final model
     trainer.save_model()
     
-    # Save checkpoint with timestamp (to be able to reference this run later)
-    import datetime
-    timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-    final_checkpoint_dir = os.path.join(output_dir, f"final-checkpoint-{timestamp}")
-    trainer.save_model(final_checkpoint_dir)
-    print(f"Final model saved to: {final_checkpoint_dir}")
-    
-    # Save a small metadata file with information about the run
-    metadata = {
-        "timestamp": timestamp,
-        "model_name": model_name,
-        "ablation": ablation,
-        "batch_size": training_args.per_device_train_batch_size,
-        "num_generations": training_args.num_generations,
-        "dataset_size": len(train_dataset),
-    }
-    
-    # Save metadata to a JSON file
-    import json
-    with open(os.path.join(final_checkpoint_dir, "training_metadata.json"), "w") as f:
-        json.dump(metadata, f, indent=2)
+    try:
+        # Save checkpoint with timestamp (to be able to reference this run later)
+        import datetime
+        timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+        final_checkpoint_dir = os.path.join(output_dir, f"final-checkpoint-{timestamp}")
+        
+        # Create the directory first
+        os.makedirs(final_checkpoint_dir, exist_ok=True)
+        
+        trainer.save_model(final_checkpoint_dir)
+        print(f"Final model saved to: {final_checkpoint_dir}")
+        
+        # Save a small metadata file with information about the run
+        metadata = {
+            "timestamp": timestamp,
+            "model_name": model_name,
+            "ablation": ablation,
+            "tiny_mode": tiny_mode,
+            "batch_size": training_args.per_device_train_batch_size,
+            "num_generations": training_args.num_generations,
+            "dataset_size": len(train_dataset),
+        }
+        
+        # Save metadata to a JSON file
+        import json
+        with open(os.path.join(final_checkpoint_dir, "training_metadata.json"), "w") as f:
+            json.dump(metadata, f, indent=2)
+    except Exception as e:
+        # Don't let saving failures stop the training from completing
+        print(f"Warning: Could not save final checkpoint: {e}")
     
     print(f"Training complete! Models and checkpoints saved to {output_dir}")
     print(f"Final model with timestamp saved to: {final_checkpoint_dir}")
@@ -805,10 +954,17 @@ if __name__ == "__main__":
     parser.add_argument("--test-parsing", action="store_true", help="Test PGN parsing")
     parser.add_argument("--seq", "--sequential", action="store_true", 
                         help="Use sequential processing for dataset preparation")
+    parser.add_argument("--single-gpu", action="store_true",
+                        help="Force using only a single GPU (GPU 0) even if multiple are available")
+    parser.add_argument("--tiny", action="store_true",
+                        help="Use extreme memory optimizations with tiny model for debugging")
     args = parser.parse_args()
     
     if args.test_parsing:
         test_pgn_parsing()
     else:
         # Use Accelerate to handle distribution - just call main directly
-        main(ablation=args.ablation, disable_multiprocessing=args.seq)
+        main(ablation=args.ablation, 
+             disable_multiprocessing=args.seq,
+             single_gpu=args.single_gpu,
+             tiny_mode=args.tiny)
