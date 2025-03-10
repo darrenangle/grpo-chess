@@ -527,11 +527,12 @@ def configure_wandb_logging(ablation=False):
         
         wandb.init(
             project="chess-grpo",
-            tags=["chess", "rl", "grpo", "runpod"],
+            tags=["chess", "rl", "grpo", "h200"],
             config={
                 "model": model_name,
                 "reward_functions": rewards,
-                "hardware": "runpod-single-gpu",
+                "hardware": "runpod-h200-141gb",
+                "batch_size": 16,
                 "ablation": ablation,
             }
         )
@@ -550,7 +551,7 @@ def main(ablation=False, disable_multiprocessing=False):
                  ignoring move quality rewards from Stockfish.
         disable_multiprocessing: If True, disable multiprocessing for dataset preparation.
     """
-    # Initialize accelerator for single GPU
+    # Initialize accelerator for high-end single GPU (H200)
     accelerator = Accelerator()
     
     # Print GPU info
@@ -560,9 +561,14 @@ def main(ablation=False, disable_multiprocessing=False):
         print(f"Training on: {gpu_properties.name}")
         print(f"GPU Memory: {gpu_properties.total_memory / 1e9:.2f} GB")
         print(f"CUDA Version: {torch.version.cuda}")
+        
+        # Optimize performance for large GPUs
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cuda.matmul.allow_tf32 = True
     
     print(f"Device: {accelerator.device}")
     print(f"PyTorch version: {torch.__version__}")
+    print(f"Using high-performance settings for H200 (141GB VRAM)")
     
     # Configure wandb logging with useful tags
     if "wandb" in sys.modules:
@@ -590,11 +596,11 @@ def main(ablation=False, disable_multiprocessing=False):
         lr_scheduler_type='cosine',
         logging_steps=1,
         bf16=True,
-        per_device_train_batch_size=2,       # Larger batch size for single powerful GPU
-        gradient_accumulation_steps=4,       # Gradient accumulation for effective batch size of 8
-        num_generations=2,                   # Two generations per prompt for GRPO
-        max_prompt_length=512,               # Chess games can be long
-        max_completion_length=2048,          # Long completion to ensure full answers
+        per_device_train_batch_size=16,      # Large batch size for H200 with 141GB VRAM
+        gradient_accumulation_steps=1,       # No need for gradient accumulation with large GPU
+        num_generations=4,                   # More generations per prompt for better GRPO
+        max_prompt_length=1024,              # Allow long context for chess games
+        max_completion_length=4096,          # Long completion for detailed reasoning
         num_train_epochs=1,
         save_strategy="steps",               # Save at regular steps
         save_steps=100,                      # Save every 100 steps (must match eval_steps)
@@ -608,28 +614,37 @@ def main(ablation=False, disable_multiprocessing=False):
         max_grad_norm=0.1,
         report_to="wandb",
         log_on_each_node=False,
-        dataloader_num_workers=4,             # Enable parallel data loading on powerful machine
-        gradient_checkpointing=False,         # Disable gradient checkpointing for speed
-        # Single GPU configuration
+        dataloader_num_workers=12,            # High parallelism for data loading on H200
+        gradient_checkpointing=False,         # Disable gradient checkpointing (plenty of VRAM)
+        optim="adamw_torch",                  # Use PyTorch's efficient AdamW implementation
+        # H200 high-performance configuration
     )
     
-    # PEFT configuration
+    # Enhanced PEFT configuration for H200
     peft_config = LoraConfig(
-        r=16,
-        lora_alpha=64,
+        r=32,                   # Larger rank for better adaptation with H200's VRAM
+        lora_alpha=64,          # Keep alpha in reasonable range
         target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "up_proj", "down_proj", "gate_proj"],
         task_type="CAUSAL_LM",
-        lora_dropout=0.05,
+        lora_dropout=0.05,      # Standard dropout
+        bias="lora",            # Train biases as well for better adaptation
     )
     
-    # Load the model optimized for single powerful GPU
+    # Load the model optimized for H200 with 141GB VRAM
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
         torch_dtype=torch.bfloat16,
-        device_map="auto",  # Use auto device mapping for single GPU
-        low_cpu_mem_usage=True  # Optimize CPU memory usage during loading
+        device_map="auto",  # Use auto device mapping for H200
+        low_cpu_mem_usage=True,  # Optimize CPU memory usage during loading
+        use_cache=True  # Enable KV-cache for faster inference
     )
-    print(f"Loading model: {model_name} on {accelerator.device}")
+    print(f"Loading model: {model_name} on {accelerator.device} (H200)")
+    
+    if torch.cuda.is_available():
+        # Print initial memory usage 
+        allocated = torch.cuda.memory_allocated() / (1024**3)
+        reserved = torch.cuda.memory_reserved() / (1024**3)
+        print(f"Initial GPU memory: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved")
     
     
     # Load the tokenizer
