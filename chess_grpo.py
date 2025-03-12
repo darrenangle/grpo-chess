@@ -86,7 +86,15 @@ def is_valid_move(move_str: str, fen: str) -> bool:
         return False
 
 def evaluate_move(move_str: str, fen: str, stockfish_instance: Stockfish) -> float:
-    """Evaluate a move using Stockfish with 10 top moves."""
+    """
+    Evaluate a move using Stockfish with 20 top moves.
+    
+    Returns a reward based on the move's ranking in Stockfish's evaluation:
+    - Top move: 1.0
+    - Uses a non-linear decay for rewards (exponential)
+    - Even the 20th move gets a small reward (0.1)
+    - Legal moves outside top 20 get minimal reward (0.05)
+    """
     if not STOCKFISH_AVAILABLE:
         return 0.0
     
@@ -99,19 +107,28 @@ def evaluate_move(move_str: str, fen: str, stockfish_instance: Stockfish) -> flo
         # Set up the position
         stockfish_instance.set_fen_position(fen)
         
-        # Get top 10 moves from Stockfish
-        top_moves = stockfish_instance.get_top_moves(10)
+        # Get top 20 moves from Stockfish
+        top_moves = stockfish_instance.get_top_moves(20)
+        
+        # Check if we got moves back
+        if not top_moves:
+            print(f"Warning: No moves returned by Stockfish for position {fen}")
+            return 0.0
         
         # Check if our move is among the top moves
         for i, move_info in enumerate(top_moves):
             top_move = move_info['Move']
             if move_str.lower() == top_move.lower():
-                # Return reward based on rank (best = 1.0, gradually decreasing)
-                # Top move gets 1.0, then 0.9, 0.8, etc.
-                return 1.0 - (i * 0.1)
+                # Non-linear reward decay:
+                # 1st: 1.0, 2nd: 0.95, 3rd: 0.9, 5th: 0.8, 10th: 0.5, 20th: 0.1
+                return max(0.1, 1.0 * (0.95 ** i))
         
-        # Move not in top 10
-        return 0.0  # No reward if not in top 10
+        # Move not in top 20, check if it's at least legal
+        if is_valid_move(move_str, fen):
+            return 0.05  # Small reward for legal moves not in top 20
+        
+        # Illegal move
+        return 0.0
     except Exception as e:
         print(f"Error evaluating move: {e}")
         return 0.0
@@ -368,7 +385,14 @@ def legal_move_reward_func(prompts, completions, fen, **kwargs) -> list[float]:
             for move, f in zip(extracted_moves, fen)]
 
 def stockfish_reward_func(prompts, completions, fen, **kwargs) -> list[float]:
-    """Reward function that uses Stockfish to evaluate the move quality."""
+    """
+    Reward function that uses Stockfish to evaluate the move quality.
+    
+    Gets the top 20 moves from Stockfish and provides rewards with a bias toward better moves:
+    - Top move: 1.0
+    - Reward decays non-linearly for lower-ranked moves
+    - All moves in top 20 get some reward
+    """
     if not STOCKFISH_AVAILABLE:
         return [0.0] * len(completions)
     
@@ -381,21 +405,66 @@ def stockfish_reward_func(prompts, completions, fen, **kwargs) -> list[float]:
     responses = [completion[0]["content"] for completion in completions]
     extracted_moves = [extract_xml_answer(r) for r in responses]
     
+    # Print debug info for the first example
+    if len(extracted_moves) > 0:
+        print(f"\n--- Stockfish Reward ---")
+        print(f"Extracted move: '{extracted_moves[0]}'")
+    
     rewards = []
     for move, f in zip(extracted_moves, fen):
+        if not move or not f:  # Skip invalid moves/positions
+            rewards.append(0.0)
+            continue
+            
         try:
             stockfish_instance.set_fen_position(f)
-            top_moves = stockfish_instance.get_top_moves(10)
+            # Get top 20 moves from Stockfish
+            top_moves = stockfish_instance.get_top_moves(20)
             
-            # Check if the move is in the top 10
+            # Check if we actually got moves back
+            if not top_moves:
+                print(f"Warning: No moves returned by Stockfish for position {f}")
+                rewards.append(0.0)
+                continue
+                
+            # If this is the first example, print top moves for debugging
+            if len(rewards) == 0:
+                print(f"Top 5 Stockfish moves:")
+                for i, m in enumerate(top_moves[:5]):
+                    print(f"  {i+1}. {m['Move']} (Centipawn: {m.get('Centipawn', 'N/A')})")
+            
+            # Check if the move is in the top 20
             for i, move_info in enumerate(top_moves):
                 if move.lower() == move_info['Move'].lower():
-                    # Reward based on rank (1.0 for best, decreasing by 0.1)
-                    rewards.append(1.0 - (i * 0.1))
+                    # Non-linear reward function:
+                    # - Top move gets 1.0
+                    # - Reward decays faster for lower ranks
+                    # - Even the 20th move gets a small reward
+                    
+                    # For non-linear decay, use a sigmoid-like or exponential decay
+                    # This formula gives approximately:
+                    # 1st: 1.0, 2nd: 0.95, 3rd: 0.9, 5th: 0.8, 10th: 0.5, 20th: 0.1
+                    reward = max(0.1, 1.0 * (0.95 ** i))
+                    
+                    rewards.append(reward)
+                    
+                    # Debug message for first example
+                    if len(rewards) == 1:
+                        print(f"Move '{move}' found at rank {i+1}, reward: {reward:.3f}")
                     break
             else:
-                # Not in top 10, zero reward
-                rewards.append(0.0)
+                # Not in top 20, smaller reward for legal moves that aren't terrible
+                # Check if the move is at least legal
+                if is_valid_move(move, f):
+                    minimal_reward = 0.05  # Small reward for legal moves
+                    rewards.append(minimal_reward)
+                    if len(rewards) == 1:
+                        print(f"Move '{move}' not in top 20 but legal, reward: {minimal_reward}")
+                else:
+                    rewards.append(0.0)
+                    if len(rewards) == 1:
+                        print(f"Move '{move}' not in top 20 and not legal, reward: 0.0")
+                
         except Exception as e:
             print(f"Error in stockfish evaluation: {e}")
             rewards.append(0.0)
@@ -427,7 +496,9 @@ def correctness_reward_func(prompts, completions, next_move, fen, **kwargs) -> l
     """
     Reward function that evaluates the move played in the actual game.
     If the predicted move matches the game move, the reward is based on how good that move is
-    according to Stockfish.
+    according to Stockfish's top 20 moves.
+    
+    Uses the same non-linear reward decay as the stockfish_reward_func.
     """
     if not STOCKFISH_AVAILABLE:
         return [0.0] * len(completions)
@@ -450,32 +521,53 @@ def correctness_reward_func(prompts, completions, next_move, fen, **kwargs) -> l
     
     rewards = []
     for move, nm, f in zip(extracted_moves, next_move, fen):
+        if not move or not nm or not f:  # Skip invalid data
+            rewards.append(0.0)
+            continue
+            
         if move.strip() == nm.strip():
             # If the move matches the game move, evaluate the game move with Stockfish
             try:
                 # Create a fresh instance to prevent state issues
                 fresh_stockfish = Stockfish(path=STOCKFISH_PATH)
                 fresh_stockfish.set_fen_position(f)
-                top_moves = fresh_stockfish.get_top_moves(10)
+                top_moves = fresh_stockfish.get_top_moves(20)
+                
+                # Check if we got moves back
+                if not top_moves:
+                    print(f"Warning: No moves returned by Stockfish for position {f}")
+                    rewards.append(0.5)  # Default reward for matching game move when Stockfish fails
+                    continue
+                
+                # If this is the first example, print where the game move ranks
+                if len(rewards) == 0:
+                    print(f"Checking game move '{nm}' against Stockfish rankings")
                 
                 # Check where the game move ranks in Stockfish's evaluation
                 for i, move_info in enumerate(top_moves):
                     top_move = move_info['Move']
                     if nm.lower() == top_move.lower():
-                        # Game move is in top 10, reward based on rank
-                        reward = 1.0 - (i * 0.1)
+                        # Same non-linear decay as in stockfish_reward_func
+                        # 1st: 1.0, 2nd: 0.95, 3rd: 0.9, 5th: 0.8, 10th: 0.5, 20th: 0.1
+                        reward = max(0.1, 1.0 * (0.95 ** i))
+                        
+                        # Bonus for matching the exact move played in the game
+                        reward += 0.2  # Bonus for matching historical moves
+                        reward = min(1.0, reward)  # Cap at 1.0
+                        
                         rewards.append(reward)
                         if len(rewards) == 1:  # Only for first example
-                            print(f"Stockfish rank: {i+1}, reward: {reward}")
+                            print(f"Game move at Stockfish rank {i+1}, reward: {reward:.3f}")
                         break
                 else:
-                    # Game move not in top 10, no reward
-                    rewards.append(0.0)
+                    # Game move not in top 20, but it's a match so give small reward
+                    reward = 0.2  # Reward for matching the game move even if not top rated
+                    rewards.append(reward)
                     if len(rewards) == 1:  # Only for first example
-                        print("Move not in Stockfish top 10, reward: 0.0")
+                        print(f"Game move not in Stockfish top 20, but matched. Reward: {reward}")
             except Exception as e:
                 print(f"Error evaluating game move: {e}")
-                rewards.append(0.0)  # No reward if evaluation fails
+                rewards.append(0.1)  # Small reward if matching but evaluation fails
         else:
             rewards.append(0.0)  # No reward if predicted move doesn't match game move
             if len(rewards) == 1:  # Only for first example
@@ -525,24 +617,123 @@ def configure_wandb_logging(ablation=False):
         model_name = "nvidia/AceInstruct-7B"
         rewards = "format,legal" if ablation else "format,legal,stockfish,correctness"
         
+        # Generate a unique run ID for both WandB and HF Hub
+        import datetime
+        run_id = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+        
         wandb.init(
             project="chess-grpo",
-            tags=["chess", "rl", "grpo", "h200"],
+            tags=["chess", "rl", "grpo", "h200", "3-epochs"],
             config={
                 "model": model_name,
                 "reward_functions": rewards,
                 "hardware": "runpod-h200-141gb",
                 "batch_size": 16,
+                "epochs": 3,
                 "ablation": ablation,
+                "run_id": run_id
             }
         )
-        return True
+        return True, run_id
     except Exception as e:
         print(f"Warning: Could not initialize wandb: {e}")
         print("Training will continue without wandb logging.")
+        return False, datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+
+def push_to_hub(model, tokenizer, trainer, checkpoint_dir, repo_name, message=None):
+    """
+    Push model, tokenizer and training artifacts to the Hugging Face Hub.
+    
+    Args:
+        model: The trained model
+        tokenizer: The tokenizer used for training
+        trainer: The GRPO trainer instance
+        checkpoint_dir: The directory containing the checkpoint to push
+        repo_name: The name of the repository to push to (e.g., 'username/model-name')
+        message: Optional commit message
+    
+    Returns:
+        True if successful, False otherwise
+    """
+    try:
+        from huggingface_hub import HfApi, create_repo
+        import subprocess
+        import sys
+        
+        # Make sure we have a valid repo name
+        if "/" not in repo_name:
+            print(f"Error: repo_name must include username (e.g., 'username/{repo_name}')")
+            return False
+        
+        print(f"Pushing model to Hugging Face Hub: {repo_name}")
+        
+        # Create the repo if it doesn't exist
+        try:
+            create_repo(repo_name, exist_ok=True)
+        except Exception as e:
+            print(f"Warning: Could not create repo: {e}")
+            print(f"Will attempt to push to existing repo.")
+        
+        # Get API instance
+        api = HfApi()
+        
+        # Check if we have login credentials or token
+        try:
+            # Check if we have a stored token
+            api.whoami()
+            print("Already logged in to Hugging Face Hub")
+        except Exception as e:
+            print(f"Not logged in to Hugging Face Hub: {e}")
+            # Check if HF_TOKEN is set
+            if "HF_TOKEN" in os.environ:
+                print("Using HF_TOKEN from environment")
+            else:
+                print("Warning: Not logged in and no HF_TOKEN found in environment")
+                print("Please login with `huggingface-cli login` or provide --hub-token")
+                return False
+        
+        # Upload training artifacts
+        if not message:
+            message = f"Chess GRPO model trained on {len(trainer.train_dataset)} samples"
+        
+        # Try to push the model using the trainer's built-in method
+        try:
+            print("Pushing model to Hub using trainer.push_to_hub...")
+            trainer.push_to_hub(
+                repo_id=repo_name,
+                commit_message=message
+            )
+        except Exception as e:
+            print(f"Error pushing with trainer: {e}")
+            print("Falling back to manual push...")
+            
+            # Fallback: Manual push using subprocess
+            try:
+                # Install transformers CLI if needed
+                subprocess.check_call([
+                    sys.executable, "-m", "pip", "install", "--upgrade", "transformers"
+                ])
+                
+                # Push the model using the transformers CLI
+                subprocess.check_call([
+                    "transformers-cli", "upload", checkpoint_dir, repo_name,
+                    "--organization" if "/" in repo_name else None,
+                    repo_name.split("/")[0] if "/" in repo_name else None
+                ])
+            except Exception as e2:
+                print(f"Error with manual push: {e2}")
+                print("Fallback also failed. Model only available locally.")
+                return False
+        
+        print(f"Successfully pushed model to Hugging Face Hub: {repo_name}")
+        print(f"Model available at: https://huggingface.co/{repo_name}")
+        return True
+    except Exception as e:
+        print(f"Error pushing to hub: {e}")
+        print("Training artifacts will only be available locally.")
         return False
 
-def main(ablation=False, disable_multiprocessing=False):
+def main(ablation=False, disable_multiprocessing=False, push_to_hub_name=None):
     """
     Main training function with optional ablation mode.
     
@@ -550,6 +741,8 @@ def main(ablation=False, disable_multiprocessing=False):
         ablation: If True, only train with format and legality rewards,
                  ignoring move quality rewards from Stockfish.
         disable_multiprocessing: If True, disable multiprocessing for dataset preparation.
+        push_to_hub_name: If provided, push the model to the Hugging Face Hub with this name
+                        (should be in format 'username/model-name').
     """
     # Initialize accelerator for high-end single GPU (H200)
     accelerator = Accelerator()
@@ -571,29 +764,35 @@ def main(ablation=False, disable_multiprocessing=False):
     print(f"Using high-performance settings for H200 (141GB VRAM)")
     
     # Configure wandb logging with useful tags
+    run_id = None
     if "wandb" in sys.modules:
-        configure_wandb_logging(ablation=ablation)
+        wandb_success, run_id = configure_wandb_logging(ablation=ablation)
+    else:
+        # Generate a unique run ID even if wandb is not used
+        import datetime
+        run_id = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    
     # Model and training configuration
     model_name = "nvidia/AceInstruct-7B"
     
-    # Prepare output directory with ablation indicator if needed
+    # Prepare output directory with ablation indicator and unique run ID
     if ablation:
-        output_dir = "outputs/Chess-GRPO-Ablation"
-        run_name = "Chess-GRPO-Ablation-Training"
+        output_dir = f"outputs/Chess-GRPO-Ablation-{run_id}"
+        run_name = f"Chess-GRPO-Ablation-{run_id}"
     else:
-        output_dir = "outputs/Chess-GRPO"
-        run_name = "Chess-GRPO-Training"
+        output_dir = f"outputs/Chess-GRPO-{run_id}"
+        run_name = f"Chess-GRPO-{run_id}"
     
     # Training configuration with fixed batch sizes
     training_args = GRPOConfig(
         output_dir=output_dir,
         run_name=run_name,
-        learning_rate=5e-6,
+        learning_rate=8e-6,                  # Slightly higher learning rate
         adam_beta1=0.9,
-        adam_beta2=0.99,
-        weight_decay=0.1,
-        warmup_ratio=0.1,
-        lr_scheduler_type='cosine',
+        adam_beta2=0.999,
+        weight_decay=0.01,                  # Less regularization for multi-epoch
+        warmup_ratio=0.05,                  # Shorter warmup with multiple epochs
+        lr_scheduler_type='cosine',         # Cosine decay over the 3 epochs
         logging_steps=1,
         bf16=True,
         per_device_train_batch_size=16,      # Large batch size for H200 with 141GB VRAM
@@ -601,7 +800,7 @@ def main(ablation=False, disable_multiprocessing=False):
         num_generations=4,                   # More generations per prompt for better GRPO
         max_prompt_length=1024,              # Allow long context for chess games
         max_completion_length=4096,          # Long completion for detailed reasoning
-        num_train_epochs=1,
+        num_train_epochs=3,                  # Train for 3 full epochs
         save_strategy="steps",               # Save at regular steps
         save_steps=100,                      # Save every 100 steps (must match eval_steps)
         save_total_limit=50,                 # Keep last 50 checkpoints
@@ -617,6 +816,10 @@ def main(ablation=False, disable_multiprocessing=False):
         dataloader_num_workers=12,            # High parallelism for data loading on H200
         gradient_checkpointing=False,         # Disable gradient checkpointing (plenty of VRAM)
         optim="adamw_torch",                  # Use PyTorch's efficient AdamW implementation
+        # Configure HuggingFace Hub integration if requested
+        push_to_hub=bool(push_to_hub_name),
+        hub_model_id=push_to_hub_name,
+        hub_strategy="checkpoint",            # Push model at each checkpoint save
         # H200 high-performance configuration
     )
     
@@ -714,6 +917,29 @@ def main(ablation=False, disable_multiprocessing=False):
         ]
     )
     
+    # Custom callback to push to Hub after each checkpoint
+    class PushToHubCallback(transformers.TrainerCallback):
+        def on_save(self, args, state, control, **kwargs):
+            if hasattr(trainer, "push_to_hub") and args.push_to_hub and args.hub_model_id:
+                print(f"Pushing checkpoint at step {state.global_step} to the Hub...")
+                # The trainer will automatically handle pushing to the hub
+                return control
+            return control
+    
+    # Add our callback if needed
+    if push_to_hub_name:
+        trainer.add_callback(PushToHubCallback())
+        print(f"Added callback to push checkpoints to Hugging Face Hub: {push_to_hub_name}")
+        # Install huggingface_hub if not already installed
+        try:
+            import huggingface_hub
+            print(f"Using huggingface_hub version: {huggingface_hub.__version__}")
+        except ImportError:
+            print("huggingface_hub not installed. Installing...")
+            subprocess.check_call([sys.executable, "-m", "pip", "install", "huggingface_hub"])
+            import huggingface_hub
+            print(f"Installed huggingface_hub version: {huggingface_hub.__version__}")
+    
     # Train the model
     trainer.train()
     
@@ -721,20 +947,19 @@ def main(ablation=False, disable_multiprocessing=False):
     trainer.save_model()
     
     # Save checkpoint with timestamp (to be able to reference this run later)
-    import datetime
-    timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-    final_checkpoint_dir = os.path.join(output_dir, f"final-checkpoint-{timestamp}")
+    final_checkpoint_dir = os.path.join(output_dir, f"final-checkpoint-{run_id}")
     trainer.save_model(final_checkpoint_dir)
     print(f"Final model saved to: {final_checkpoint_dir}")
     
     # Save a small metadata file with information about the run
     metadata = {
-        "timestamp": timestamp,
+        "run_id": run_id,
         "model_name": model_name,
         "ablation": ablation,
         "batch_size": training_args.per_device_train_batch_size,
         "num_generations": training_args.num_generations,
         "dataset_size": len(train_dataset),
+        "hub_model_id": push_to_hub_name if push_to_hub_name else None,
     }
     
     # Save metadata to a JSON file
@@ -742,8 +967,26 @@ def main(ablation=False, disable_multiprocessing=False):
     with open(os.path.join(final_checkpoint_dir, "training_metadata.json"), "w") as f:
         json.dump(metadata, f, indent=2)
     
+    # Final push to the Hugging Face Hub if requested
+    if push_to_hub_name:
+        if not training_args.push_to_hub:  # If we didn't already set up automatic pushing
+            try:
+                print(f"Pushing final model to Hugging Face Hub: {push_to_hub_name}")
+                # Push the final model to the Hub
+                trainer.push_to_hub(commit_message=f"Final model: Chess GRPO {run_id}")
+            except Exception as e:
+                print(f"Error pushing final model to Hub: {e}")
+                # Try manual push as fallback
+                try:
+                    push_to_hub(model, tokenizer, trainer, final_checkpoint_dir, 
+                               push_to_hub_name, message=f"Final model: Chess GRPO {run_id}")
+                except Exception as e2:
+                    print(f"Failed to push to Hub with fallback method: {e2}")
+    
     print(f"Training complete! Models and checkpoints saved to {output_dir}")
-    print(f"Final model with timestamp saved to: {final_checkpoint_dir}")
+    print(f"Final model saved to: {final_checkpoint_dir}")
+    if push_to_hub_name:
+        print(f"Model also available on Hugging Face Hub: https://huggingface.co/{push_to_hub_name}")
 
 def test_pgn_parsing():
     """Test function to demonstrate PGN parsing and sequence generation."""
@@ -789,10 +1032,28 @@ def launch_single_gpu_training():
     
     # Build command line arguments to pass through
     cmd_args = []
+    
+    # Check for ablation mode
     if "--ablation" in sys.argv:
         cmd_args.append("--ablation")
+    
+    # Check for sequential processing
     if "--seq" in sys.argv or "--sequential" in sys.argv:
         cmd_args.append("--seq")
+    
+    # Always add direct flag when using accelerate
+    cmd_args.append("--direct")
+    
+    # Check for HuggingFace Hub integration
+    for i, arg in enumerate(sys.argv):
+        if arg == "--push-to-hub" and i+1 < len(sys.argv):
+            cmd_args.extend(["--push-to-hub", sys.argv[i+1]])
+        elif arg.startswith("--push-to-hub="):
+            cmd_args.append(arg)
+        elif arg == "--hub-token" and i+1 < len(sys.argv):
+            cmd_args.extend(["--hub-token", sys.argv[i+1]])
+        elif arg.startswith("--hub-token="):
+            cmd_args.append(arg)
     
     # Launch with accelerate
     cmd = [
@@ -801,6 +1062,7 @@ def launch_single_gpu_training():
         sys.argv[0]
     ] + cmd_args
     
+    print(f"Running command: {' '.join(cmd)}")
     subprocess.run(cmd)
 
 if __name__ == "__main__":
@@ -813,13 +1075,24 @@ if __name__ == "__main__":
                         help="Use sequential processing for dataset preparation")
     parser.add_argument("--direct", action="store_true", 
                         help="Run directly without using accelerate launcher")
+    parser.add_argument("--push-to-hub", type=str, metavar="USERNAME/REPO_NAME", 
+                        help="Push model checkpoints to Hugging Face Hub (format: username/model-name)")
+    parser.add_argument("--hub-token", type=str, metavar="TOKEN", 
+                        help="Hugging Face API Token (alternatively, use HF_TOKEN env variable)")
     args = parser.parse_args()
+    
+    # Set HF token in environment if provided
+    if args.hub_token:
+        os.environ["HF_TOKEN"] = args.hub_token
+        print("Using provided Hugging Face token")
     
     if args.test_parsing:
         test_pgn_parsing()
     elif args.direct:
         # Call main directly when launched manually
-        main(ablation=args.ablation, disable_multiprocessing=args.seq)
+        main(ablation=args.ablation, 
+             disable_multiprocessing=args.seq, 
+             push_to_hub_name=args.push_to_hub)
     else:
         # Launch with accelerate for optimal single GPU performance
         launch_single_gpu_training()

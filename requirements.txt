@@ -10,3 +10,4 @@ accelerate>=0.22.0
 deepspeed>=0.10.0
 ninja  # For faster compilation
 psutil # For memory monitoring
+huggingface_hub>=0.19.0  # For HF Hub integration
