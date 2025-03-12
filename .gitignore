@@ -20,6 +20,10 @@ var/
 .installed.cfg
 *.egg
 
+# HuggingFace Hub
+.cache/
+tokens.txt
+
 # Jupyter Notebook
 .ipynb_checkpoints
 
