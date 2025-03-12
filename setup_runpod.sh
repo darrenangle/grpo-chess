@@ -5,7 +5,7 @@
 set -e  # Exit on any error
 
 # Default values
-REPO_URL="https://github.com/yourusername/grpo-chess.git"
+REPO_URL="https://github.com/darrenangle/grpo-chess.git"
 WANDB_API_KEY=""
 HF_TOKEN=""
 HF_REPO=""
